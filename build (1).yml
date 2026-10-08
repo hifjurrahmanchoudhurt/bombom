@@ -1,0 +1,330 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project and build
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'CBEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ChatBuddy"
+          include(":app")
+          CBEOF
+          mkdir -p .
+          cat > build.gradle.kts <<'CBEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          CBEOF
+          mkdir -p .
+          cat > gradle.properties <<'CBEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          CBEOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'CBEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.hif.chatbuddy"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.hif.chatbuddy"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          CBEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'CBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application android:label="Chat Buddy" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ChatBuddyService"
+                      android:label="Chat Buddy"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data android:name="android.view.im" android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          CBEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/method.xml <<'CBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android" />
+          CBEOF
+          mkdir -p app/src/main/java/com/hif/chatbuddy
+          cat > app/src/main/java/com/hif/chatbuddy/MainActivity.kt <<'CBEOF'
+          package com.hif.chatbuddy
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = (resources.displayMetrics.density * 20).toInt()
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(p, p * 2, p, p) }
+                  fun tv(s: String, size: Float) = TextView(this).apply { text = s; textSize = size; setPadding(0, p / 2, 0, p / 2) }
+                  col.addView(tv("Chat Buddy keyboard", 24f))
+                  col.addView(tv("Set up in 2 taps:", 16f))
+                  col.addView(Button(this).apply {
+                      text = "1. Turn on Chat Buddy"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }
+                  })
+                  col.addView(Button(this).apply {
+                      text = "2. Switch to Chat Buddy"
+                      setOnClickListener {
+                          (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                      }
+                  })
+                  col.addView(tv("Then open Instagram, tap a chat, and use the keyboard. Copy her message and tap Decode.", 14f))
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+          }
+          CBEOF
+          mkdir -p app/src/main/java/com/hif/chatbuddy
+          cat > app/src/main/java/com/hif/chatbuddy/ChatBuddyService.kt <<'CBEOF'
+          package com.hif.chatbuddy
+
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.inputmethodservice.InputMethodService
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.*
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          class ChatBuddyService : InputMethodService() {
+
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var body: FrameLayout
+              private var shift = false
+              private var lastTerm = ""
+              private val BG = Color.parseColor("#1B1B1F")
+              private val KEY = Color.parseColor("#2C2C33")
+              private val ACC = Color.parseColor("#E1306C")
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun type(s: String) { currentInputConnection?.commitText(s, 1) }
+
+              private fun btn(label: String, w: Float = 1f, bg: Int = KEY, onClick: () -> Unit): Button =
+                  Button(this).apply {
+                      text = label; isAllCaps = false; setTextColor(Color.WHITE); setBackgroundColor(bg)
+                      textSize = 16f; minWidth = 0; minimumWidth = 0; setPadding(0, 0, 0, 0)
+                      layoutParams = LinearLayout.LayoutParams(0, dp(46), w).apply { setMargins(dp(2), dp(3), dp(2), dp(3)) }
+                      setOnClickListener { onClick() }
+                  }
+
+              private fun row(vararg v: View) = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  v.forEach { addView(it) }
+              }
+
+              override fun onCreateInputView(): View {
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG) }
+                  val bar = row(
+                      btn("⌨️ Keys") { showKeys() },
+                      btn("🔍 Decode", 1.4f, ACC) { showDecode() },
+                      btn("💡 Ideas") { showIdeas() },
+                      btn("🌐") {
+                          (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                      }
+                  )
+                  body = FrameLayout(this)
+                  root.addView(bar)
+                  root.addView(body, LinearLayout.LayoutParams(-1, dp(264)))
+                  showKeys()
+                  return root
+              }
+
+              private fun show(v: View) {
+                  body.removeAllViews()
+                  body.addView(v, FrameLayout.LayoutParams(-1, -1))
+              }
+
+              // ---------- normal typing ----------
+              private fun showKeys() {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(row(*"1234567890".map { c -> btn(c.toString()) { type(c.toString()) } }.toTypedArray()))
+                  listOf("qwertyuiop", "asdfghjkl", "zxcvbnm").forEachIndexed { i, r ->
+                      val keys = r.map { c ->
+                          btn(c.toString()) {
+                              type(if (shift) c.uppercase() else c.toString())
+                              if (shift) { shift = false; showKeys() }
+                          }
+                      }.toMutableList<View>()
+                      if (i == 2) {
+                          keys.add(0, btn("⇧", 1.5f, if (shift) ACC else KEY) { shift = !shift; showKeys() })
+                          keys.add(btn("⌫", 1.5f) { sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL) })
+                      }
+                      col.addView(row(*keys.toTypedArray()))
+                  }
+                  col.addView(row(
+                      btn(",") { type(",") },
+                      btn("space", 5f) { type(" ") },
+                      btn(".") { type(".") },
+                      btn("↵", 1.5f, ACC) { sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER) }
+                  ))
+                  show(col)
+              }
+
+              // ---------- decode: web lookup, no AI ----------
+              private fun clipText(): String {
+                  val clip = (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip
+                  return if (clip != null && clip.itemCount > 0)
+                      clip.getItemAt(0).coerceToText(this)?.toString()?.trim().orEmpty() else ""
+              }
+
+              private fun showDecode() {
+                  var src = clipText()
+                  if (src.isBlank()) src = currentInputConnection?.getTextBeforeCursor(80, 0)?.toString().orEmpty()
+                  val words = Regex("[A-Za-z']+").findAll(src.lowercase()).map { it.value }.distinct().take(20).toList()
+
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), 0) }
+                  val hint = TextView(this).apply {
+                      setTextColor(Color.LTGRAY); textSize = 12f
+                      text = "Copy her message in Instagram, then tap 🔍 Decode. Tap a word to look it up."
+                  }
+                  val out = TextView(this).apply { setTextColor(Color.WHITE); textSize = 15f; setPadding(dp(4), dp(6), dp(4), dp(6)) }
+                  val chips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  words.forEach { w ->
+                      chips.addView(TextView(this).apply {
+                          text = w; setTextColor(Color.WHITE); setBackgroundColor(KEY); textSize = 15f
+                          setPadding(dp(12), dp(8), dp(12), dp(8))
+                          layoutParams = LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(3), dp(4), dp(3), dp(4)) }
+                          setOnClickListener { lookup(w, out) }
+                      })
+                  }
+                  col.addView(hint)
+                  col.addView(HorizontalScrollView(this).apply { addView(chips) })
+                  col.addView(ScrollView(this).apply { addView(out) }, LinearLayout.LayoutParams(-1, 0, 1f))
+                  col.addView(row(btn("🌐 More on the web", 1f, ACC) {
+                      if (lastTerm.isNotBlank()) {
+                          val q = URLEncoder.encode("what does $lastTerm mean in texting", "UTF-8")
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=$q"))
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      }
+                  }))
+                  show(col)
+                  when {
+                      words.isEmpty() -> out.text = "Nothing to decode yet. Copy her message, then tap 🔍 Decode again."
+                      words.size <= 3 -> lookup(words.joinToString(" "), out)
+                      else -> out.text = "Tap a word above to see what it means."
+                  }
+              }
+
+              private fun clean(s: String) = s.replace("[", "").replace("]", "").replace("\r", "").trim()
+
+              private fun lookup(term: String, out: TextView) {
+                  lastTerm = term
+                  out.text = "Searching the web for \"$term\"…"
+                  Thread {
+                      val msg = try {
+                          val url = URL("https://api.urbandictionary.com/v0/define?term=" + URLEncoder.encode(term, "UTF-8"))
+                          val c = url.openConnection() as HttpURLConnection
+                          c.connectTimeout = 8000; c.readTimeout = 8000
+                          val arr = JSONObject(c.inputStream.bufferedReader().readText()).getJSONArray("list")
+                          if (arr.length() == 0) "No results for \"$term\". Try the web button below."
+                          else {
+                              val items = (0 until arr.length()).map { arr.getJSONObject(it) }
+                                  .sortedByDescending { it.optInt("thumbs_up") }.take(3)
+                              "Meanings of \"$term\" (most-voted first)\n\n" + items.mapIndexed { i, o ->
+                                  "${i + 1}. ${clean(o.optString("definition"))}\n   e.g. ${clean(o.optString("example"))}\n   👍 ${o.optInt("thumbs_up")}"
+                              }.joinToString("\n\n")
+                          }
+                      } catch (e: Exception) { "Couldn't reach the web. Check your internet." }
+                      ui.post { out.text = msg }
+                  }.start()
+              }
+
+              // ---------- ideas: ready-made lines, tap to insert ----------
+              private val ideas = linkedMapOf(
+                  "👋 Starting" to listOf(
+                      "ok random question, what's the last thing that made you laugh properly?",
+                      "your story made me curious, where was that?"),
+                  "🔁 Keeping it going" to listOf(
+                      "wait, tell me more about that",
+                      "that's actually interesting, how did you get into it?",
+                      "okay but what happened next?"),
+                  "😄 Playful" to listOf(
+                      "you're lowkey funny, don't let it go to your head",
+                      "hold on, I need the full story"),
+                  "☕ Making a plan" to listOf(
+                      "we should grab chai sometime, are you free this week?",
+                      "want to continue this over coffee instead of texting?"),
+                  "😶 When replies get dry" to listOf(
+                      "haha okay, I'll stop talking your ear off. how's your day been though?",
+                      "your turn, ask me anything")
+              )
+
+              private fun showIdeas() {
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
+                  ideas.forEach { (title, lines) ->
+                      col.addView(TextView(this).apply { text = title; setTextColor(ACC); textSize = 13f; setPadding(0, dp(8), 0, dp(2)) })
+                      lines.forEach { l ->
+                          col.addView(TextView(this).apply {
+                              text = l; setTextColor(Color.WHITE); setBackgroundColor(KEY); textSize = 14f
+                              setPadding(dp(10), dp(8), dp(10), dp(8))
+                              layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(2), 0, dp(2)) }
+                              setOnClickListener { type(l) }
+                          })
+                      }
+                  }
+                  show(ScrollView(this).apply { addView(col) })
+              }
+          }
+          CBEOF
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChatBuddy-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
